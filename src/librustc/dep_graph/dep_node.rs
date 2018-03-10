@@ -575,6 +575,7 @@ define_dep_nodes!( <'tcx>
     [] GetPanicStrategy(CrateNum),
     [] IsNoBuiltins(CrateNum),
     [] ImplDefaultness(DefId),
+    [] CheckItemWellFormed(DefId),
     [] ReachableNonGenerics(CrateNum),
     [] NativeLibraries(CrateNum),
     [] PluginRegistrarFn(CrateNum),
