@@ -26,9 +26,8 @@ use errors::{DiagnosticBuilder, DiagnosticId};
 use rustc::hir::intravisit::{self, Visitor, NestedVisitorMap};
 use rustc::hir;
 
-pub struct CheckTypeWellFormedVisitor<'a, 'tcx:'a> {
+pub struct CheckTypeWellFormed<'a, 'tcx:'a> {
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    code: ObligationCauseCode<'tcx>,
 }
 
 /// Helper type of a temporary returned by .for_item(...).
@@ -36,7 +35,6 @@ pub struct CheckTypeWellFormedVisitor<'a, 'tcx:'a> {
 /// F: for<'b, 'tcx> where 'gcx: 'tcx FnOnce(FnCtxt<'b, 'gcx, 'tcx>).
 struct CheckWfFcxBuilder<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
     inherited: super::InheritedBuilder<'a, 'gcx, 'tcx>,
-    code: ObligationCauseCode<'gcx>,
     id: ast::NodeId,
     span: Span,
     param_env: ty::ParamEnv<'tcx>,
@@ -45,17 +43,15 @@ struct CheckWfFcxBuilder<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
 impl<'a, 'gcx, 'tcx> CheckWfFcxBuilder<'a, 'gcx, 'tcx> {
     fn with_fcx<F>(&'tcx mut self, f: F) where
         F: for<'b> FnOnce(&FnCtxt<'b, 'gcx, 'tcx>,
-                          &mut CheckTypeWellFormedVisitor<'b, 'gcx>) -> Vec<Ty<'tcx>>
+                          &mut CheckTypeWellFormed<'b, 'gcx>) -> Vec<Ty<'tcx>>
     {
-        let code = self.code.clone();
         let id = self.id;
         let span = self.span;
         let param_env = self.param_env;
         self.inherited.enter(|inh| {
             let fcx = FnCtxt::new(&inh, param_env, id);
-            let wf_tys = f(&fcx, &mut CheckTypeWellFormedVisitor {
+            let wf_tys = f(&fcx, &mut CheckTypeWellFormed {
                 tcx: fcx.tcx.global_tcx(),
-                code,
             });
             fcx.select_all_obligations_or_error();
             fcx.regionck_item(id, span, &wf_tys);
@@ -63,12 +59,11 @@ impl<'a, 'gcx, 'tcx> CheckWfFcxBuilder<'a, 'gcx, 'tcx> {
     }
 }
 
-impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
+impl<'a, 'gcx> CheckTypeWellFormed<'a, 'gcx> {
     pub fn new(tcx: TyCtxt<'a, 'gcx, 'gcx>)
-               -> CheckTypeWellFormedVisitor<'a, 'gcx> {
-        CheckTypeWellFormedVisitor {
+               -> CheckTypeWellFormed<'a, 'gcx> {
+        CheckTypeWellFormed {
             tcx,
-            code: ObligationCauseCode::MiscObligation
         }
     }
 
@@ -83,11 +78,14 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
     /// We do this check as a pre-pass before checking fn bodies because if these constraints are
     /// not included it frequently leads to confusing errors in fn bodies. So it's better to check
     /// the types first.
-    fn check_item_well_formed(&mut self, item: &hir::Item) {
+    pub fn check_item_well_formed(&mut self, def_id: DefId) {
         let tcx = self.tcx;
+        let node_id = tcx.hir.as_local_node_id(def_id).unwrap();
+        let item = tcx.hir.expect_item(node_id);
+
         debug!("check_item_well_formed(it.id={}, it.name={})",
                item.id,
-               tcx.item_path_str(tcx.hir.local_def_id(item.id)));
+               tcx.item_path_str(def_id));
 
         match item.node {
             // Right now we check that every default trait implementation
@@ -161,11 +159,34 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
         }
     }
 
+    pub fn check_trait_item(&mut self, def_id: DefId) {
+        let node_id = self.tcx.hir.as_local_node_id(def_id).unwrap();
+        let trait_item = self.tcx.hir.expect_trait_item(node_id);
+
+        let method_sig = match trait_item.node {
+            hir::TraitItemKind::Method(ref sig, _) => Some(sig),
+            _ => None
+        };
+        CheckTypeWellFormed::new(self.tcx)
+            .check_associated_item(trait_item.id, trait_item.span, method_sig);
+    }
+
+    pub fn check_impl_item(&mut self, def_id: DefId) {
+        let node_id = self.tcx.hir.as_local_node_id(def_id).unwrap();
+        let impl_item = self.tcx.hir.expect_impl_item(node_id);
+
+        let method_sig = match impl_item.node {
+            hir::ImplItemKind::Method(ref sig, _) => Some(sig),
+            _ => None
+        };
+        self.check_associated_item(impl_item.id, impl_item.span, method_sig);
+    }
+
     fn check_associated_item(&mut self,
                              item_id: ast::NodeId,
                              span: Span,
                              sig_if_method: Option<&hir::MethodSig>) {
-        let code = self.code.clone();
+        let code = ObligationCauseCode::MiscObligation;
         self.for_id(item_id, span).with_fcx(|fcx, this| {
             let item = fcx.tcx.associated_item(fcx.tcx.hir.local_def_id(item_id));
 
@@ -213,7 +234,6 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
         let def_id = self.tcx.hir.local_def_id(id);
         CheckWfFcxBuilder {
             inherited: Inherited::build(self.tcx, def_id),
-            code: self.code.clone(),
             id,
             span,
             param_env: self.tcx.param_env(def_id),
@@ -265,7 +285,8 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
 
                 // All field types must be well-formed.
                 for field in &variant.fields {
-                    fcx.register_wf_obligation(field.ty, field.span, this.code.clone())
+                    fcx.register_wf_obligation(field.ty, field.span,
+                        ObligationCauseCode::MiscObligation)
                 }
             }
 
@@ -300,11 +321,11 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
     {
         debug!("check_item_type: {:?}", item);
 
-        self.for_item(item).with_fcx(|fcx, this| {
+        self.for_item(item).with_fcx(|fcx, _this| {
             let ty = fcx.tcx.type_of(fcx.tcx.hir.local_def_id(item.id));
             let item_ty = fcx.normalize_associated_types_in(item.span, &ty);
 
-            fcx.register_wf_obligation(item_ty, item.span, this.code.clone());
+            fcx.register_wf_obligation(item_ty, item.span, ObligationCauseCode::MiscObligation);
 
             vec![] // no implied bounds in a const etc
         });
@@ -339,7 +360,8 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
                 None => {
                     let self_ty = fcx.tcx.type_of(item_def_id);
                     let self_ty = fcx.normalize_associated_types_in(item.span, &self_ty);
-                    fcx.register_wf_obligation(self_ty, ast_self_ty.span, this.code.clone());
+                    fcx.register_wf_obligation(self_ty, ast_self_ty.span,
+                        ObligationCauseCode::MiscObligation);
                 }
             }
 
@@ -374,7 +396,8 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
             // parameter includes another (e.g., <T, U = T>). In those cases, we can't
             // be sure if it will error or not as user might always specify the other.
             if !ty.needs_subst() {
-                fcx.register_wf_obligation(ty, fcx.tcx.def_span(d), self.code.clone());
+                fcx.register_wf_obligation(ty, fcx.tcx.def_span(d),
+                    ObligationCauseCode::MiscObligation);
             }
         }
 
@@ -458,11 +481,11 @@ impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
         let sig = fcx.tcx.liberate_late_bound_regions(def_id, &sig);
 
         for input_ty in sig.inputs() {
-            fcx.register_wf_obligation(&input_ty, span, self.code.clone());
+            fcx.register_wf_obligation(&input_ty, span, ObligationCauseCode::MiscObligation);
         }
         implied_bounds.extend(sig.inputs());
 
-        fcx.register_wf_obligation(sig.output(), span, self.code.clone());
+        fcx.register_wf_obligation(sig.output(), span, ObligationCauseCode::MiscObligation);
 
         // FIXME(#25759) return types should not be implied bounds
         implied_bounds.push(sig.output());
@@ -648,6 +671,19 @@ fn reject_shadowing_type_parameters(tcx: TyCtxt, def_id: DefId) {
     }
 }
 
+pub struct CheckTypeWellFormedVisitor<'a, 'tcx: 'a> {
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+}
+
+impl<'a, 'gcx> CheckTypeWellFormedVisitor<'a, 'gcx> {
+    pub fn new(tcx: TyCtxt<'a, 'gcx, 'gcx>)
+               -> CheckTypeWellFormedVisitor<'a, 'gcx> {
+        CheckTypeWellFormedVisitor {
+            tcx,
+        }
+    }
+}
+
 impl<'a, 'tcx, 'v> Visitor<'v> for CheckTypeWellFormedVisitor<'a, 'tcx> {
     fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'v> {
         NestedVisitorMap::None
@@ -655,27 +691,22 @@ impl<'a, 'tcx, 'v> Visitor<'v> for CheckTypeWellFormedVisitor<'a, 'tcx> {
 
     fn visit_item(&mut self, i: &hir::Item) {
         debug!("visit_item: {:?}", i);
-        self.check_item_well_formed(i);
+        let def_id = self.tcx.hir.local_def_id(i.id);
+        ty::maps::queries::check_item_well_formed::ensure(self.tcx, def_id);
         intravisit::walk_item(self, i);
     }
 
     fn visit_trait_item(&mut self, trait_item: &'v hir::TraitItem) {
         debug!("visit_trait_item: {:?}", trait_item);
-        let method_sig = match trait_item.node {
-            hir::TraitItemKind::Method(ref sig, _) => Some(sig),
-            _ => None
-        };
-        self.check_associated_item(trait_item.id, trait_item.span, method_sig);
+        let def_id = self.tcx.hir.local_def_id(trait_item.id);
+        ty::maps::queries::check_trait_item_well_formed::ensure(self.tcx, def_id);
         intravisit::walk_trait_item(self, trait_item)
     }
 
     fn visit_impl_item(&mut self, impl_item: &'v hir::ImplItem) {
         debug!("visit_impl_item: {:?}", impl_item);
-        let method_sig = match impl_item.node {
-            hir::ImplItemKind::Method(ref sig, _) => Some(sig),
-            _ => None
-        };
-        self.check_associated_item(impl_item.id, impl_item.span, method_sig);
+        let def_id = self.tcx.hir.local_def_id(impl_item.id);
+        ty::maps::queries::check_impl_item_well_formed::ensure(self.tcx, def_id);
         intravisit::walk_impl_item(self, impl_item)
     }
 }
